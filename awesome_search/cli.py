@@ -10,7 +10,7 @@ import pickle
 import json
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import sys
 
 class DocumentSearchEngine:
@@ -52,15 +52,20 @@ class DocumentSearchEngine:
             json.dump(hash_log, f, indent=2)
     
     def _chunk_document(self, text: str, chunk_size: int = 500, 
-                       overlap: int = 50) -> List[str]:
-        """Split document into overlapping chunks."""
+                       overlap: int = 50) -> List[Tuple[str, int]]:
+        """
+        Split document into overlapping chunks with character positions.
+        
+        Returns:
+            List of tuples (chunk_text, start_char_position)
+        """
         chunks = []
         start = 0
         while start < len(text):
             end = start + chunk_size
             chunk = text[start:end]
             if chunk.strip():
-                chunks.append(chunk)
+                chunks.append((chunk, start))
             start += (chunk_size - overlap)
         return chunks
     
@@ -134,16 +139,17 @@ class DocumentSearchEngine:
             file_hash = self._compute_file_hash(file_path)
             hash_log[relative_path] = file_hash
             
-            # Chunk document
-            chunks = self._chunk_document(text)
+            # Chunk document with positions
+            chunks_with_pos = self._chunk_document(text)
             
-            for i, chunk in enumerate(chunks):
+            for i, (chunk, char_pos) in enumerate(chunks_with_pos):
                 all_chunks.append(chunk)
                 all_metadata.append({
                     'source': file_path.name,
                     'relative_path': relative_path,
                     'chunk_id': i,
-                    'total_chunks': len(chunks)
+                    'total_chunks': len(chunks_with_pos),
+                    'char_position': char_pos
                 })
         
         print(f"Generating embeddings for {len(all_chunks)} chunks...")
@@ -169,8 +175,72 @@ class DocumentSearchEngine:
         print(f"✓ Indexed {len(all_chunks)} chunks from {len(files)} file(s)")
         print(f"  Index saved to: {self.index_folder}")
     
+    def _get_context_around_chunk(self, file_path: Path, chunk_text: str, 
+                                   char_position: int, lines_before: int = 50,
+                                   lines_after: int = 50) -> Dict:
+        """
+        Get context lines around a chunk in the original file.
+        
+        Args:
+            file_path: Path to the source file
+            chunk_text: The chunk text to find
+            char_position: Character position where chunk starts
+            lines_before: Number of lines to include before
+            lines_after: Number of lines to include after
+            
+        Returns:
+            Dict with context information
+        """
+        # Read the file
+        with open(file_path, 'r', encoding='utf-8') as f:
+            full_text = f.read()
+        
+        # Split into lines but keep track of positions
+        lines = full_text.split('\n')
+        
+        # Find which line the chunk starts on
+        current_pos = 0
+        chunk_start_line = 0
+        chunk_end_line = 0
+        
+        for i, line in enumerate(lines):
+            line_length = len(line) + 1  # +1 for newline
+            
+            # Check if chunk starts in this line
+            if current_pos <= char_position < current_pos + line_length:
+                chunk_start_line = i
+            
+            # Check if chunk ends in this line
+            chunk_end = char_position + len(chunk_text)
+            if current_pos <= chunk_end < current_pos + line_length:
+                chunk_end_line = i
+                break
+            
+            current_pos += line_length
+        
+        # Calculate context boundaries
+        context_start = max(0, chunk_start_line - lines_before)
+        context_end = min(len(lines), chunk_end_line + lines_after + 1)
+        
+        # Extract context lines
+        before_lines = lines[context_start:chunk_start_line]
+        chunk_lines = lines[chunk_start_line:chunk_end_line + 1]
+        after_lines = lines[chunk_end_line + 1:context_end]
+        
+        return {
+            'chunk_start_line': chunk_start_line + 1,  # 1-indexed for display
+            'chunk_end_line': chunk_end_line + 1,
+            'context_start_line': context_start + 1,
+            'context_end_line': context_end,
+            'lines_before': before_lines,
+            'chunk_lines': chunk_lines,
+            'lines_after': after_lines,
+            'total_lines': len(lines)
+        }
+    
     def search(self, query: str, source_filter: Optional[str] = None, 
-               k: int = 5, threshold: float = 0.0) -> List[Dict]:
+               k: int = 5, threshold: float = 0.0,
+               context_mode: bool = False, context_lines: int = 50) -> List[Dict]:
         """
         Search the index.
         
@@ -179,9 +249,11 @@ class DocumentSearchEngine:
             source_filter: Filter by source filename (optional)
             k: Number of results
             threshold: Maximum distance threshold (0.0 = no threshold)
+            context_mode: If True, fetch surrounding lines from source file
+            context_lines: Number of lines before/after to include in context
             
         Returns:
-            List of results with text, score, and metadata
+            List of results with text, score, metadata, and optionally context
         """
         if not self.index_path.exists():
             raise FileNotFoundError(
@@ -219,11 +291,25 @@ class DocumentSearchEngine:
             if source_filter and meta['source'] != source_filter:
                 continue
             
-            results.append({
+            result = {
                 'text': chunks[idx],
                 'score': float(dist),
                 'metadata': meta
-            })
+            }
+            
+            # Add context if requested
+            if context_mode:
+                file_path = self.project_root / meta['relative_path']
+                context = self._get_context_around_chunk(
+                    file_path,
+                    chunks[idx],
+                    meta['char_position'],
+                    lines_before=context_lines,
+                    lines_after=context_lines
+                )
+                result['context'] = context
+            
+            results.append(result)
             
             if len(results) >= k:
                 break
@@ -309,6 +395,17 @@ def cmd_search():
         default=0.0,
         help='Relevancy threshold - max distance (default: 0.0 = no threshold)'
     )
+    parser.add_argument(
+        '--context',
+        action='store_true',
+        help='Enable context mode: fetch surrounding lines from source file'
+    )
+    parser.add_argument(
+        '--context-lines',
+        type=int,
+        default=50,
+        help='Number of lines before/after chunk in context mode (default: 50)'
+    )
     
     args = parser.parse_args()
     
@@ -324,7 +421,9 @@ def cmd_search():
             query=args.query,
             source_filter=args.source,
             k=args.num_results,
-            threshold=args.threshold
+            threshold=args.threshold,
+            context_mode=args.context,
+            context_lines=args.context_lines
         )
         
         if not results:
@@ -338,8 +437,36 @@ def cmd_search():
             print(f"\n[Result {i}] Score: {result['score']:.4f}")
             print(f"Source: {result['metadata']['relative_path']}")
             print(f"Chunk: {result['metadata']['chunk_id'] + 1}/{result['metadata']['total_chunks']}")
-            print("-" * 80)
-            print(result['text'])
+            
+            if 'context' in result:
+                ctx = result['context']
+                print(f"Lines: {ctx['chunk_start_line']}-{ctx['chunk_end_line']} (of {ctx['total_lines']})")
+                print(f"Context: Lines {ctx['context_start_line']}-{ctx['context_end_line']}")
+                print("-" * 80)
+                
+                # Print lines before with line numbers
+                if ctx['lines_before']:
+                    print("\n--- CONTEXT BEFORE ---")
+                    start_line = ctx['context_start_line']
+                    for j, line in enumerate(ctx['lines_before']):
+                        print(f"{start_line + j:4d} | {line}")
+                
+                # Print chunk lines highlighted
+                print("\n--- MATCHED CHUNK ---")
+                for j, line in enumerate(ctx['chunk_lines']):
+                    line_num = ctx['chunk_start_line'] + j
+                    print(f"{line_num:4d} | >>> {line}")
+                
+                # Print lines after
+                if ctx['lines_after']:
+                    print("\n--- CONTEXT AFTER ---")
+                    start_line = ctx['chunk_end_line'] + 1
+                    for j, line in enumerate(ctx['lines_after']):
+                        print(f"{start_line + j:4d} | {line}")
+            else:
+                print("-" * 80)
+                print(result['text'])
+            
             print("=" * 80)
     
     except Exception as e:

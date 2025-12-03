@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="awesome-search",
-    version="0.5.0",
+    version="0.6.0",
     description="Local FAISS-based search tool for LLM instruction documents",
     author="Trym K. Bjerkan",
     packages=find_packages(),
