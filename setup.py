@@ -11,14 +11,16 @@ setup(
     author="Trym K. Bjerkan",
     packages=find_packages(),
     install_requires=[
-        "faiss-cpu>=1.7.0",
-        "sentence-transformers>=2.2.0",
-        "numpy>=1.21.0",
+        "faiss-cpu>=1.7.4",
+        "sentence-transformers>=2.7.0",
+        "numpy>=1.26.0",
+        "textual>=0.52.1"
     ],
     entry_points={
         "console_scripts": [
             "awesomeIndexer=awesome_search.cli:cmd_indexer",
             "awesomeSearch=awesome_search.cli:cmd_search",
+            "awesomeTUI=awesome_search.tui:main"
         ],
     },
     python_requires=">=3.8",
