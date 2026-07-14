@@ -51,24 +51,148 @@ class DocumentSearchEngine:
         with open(self.hash_log_path, 'w') as f:
             json.dump(hash_log, f, indent=2)
     
-    def _chunk_document(self, text: str, chunk_size: int = 500, 
-                       overlap: int = 50) -> List[Tuple[str, int]]:
-        """
-        Split document into overlapping chunks with character positions.
+    def _chunk_document(self, text: str, chunk_size: int = 800,
+                       overlap: int = 150) -> List[Tuple[str, int]]:
+        '''
+        Split document into chunks, aware of Markdown structure (headers, code blocks).
+        Injects current context header into chunks for better retrieval.
         
         Returns:
             List of tuples (chunk_text, start_char_position)
-        """
+        '''
+        import re
         chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunk = text[start:end]
-            if chunk.strip():
-                chunks.append((chunk, start))
-            start += (chunk_size - overlap)
+
+        # Track Markdown headers
+        current_headers = {}
+
+        # We will split text into lines to process them sequentially
+        lines = text.split('\n')
+
+        current_chunk_lines = []
+        current_chunk_size = 0
+        current_chunk_start = 0
+
+        in_code_block = False
+        current_pos = 0
+
+        for i, line in enumerate(lines):
+            line_len = len(line) + 1  # +1 for newline
+
+            # Track code blocks
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+
+            # Track headers (only outside code blocks)
+            if not in_code_block:
+                header_match = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
+                if header_match:
+                    level = len(header_match.group(1))
+                    title = header_match.group(2).strip()
+
+                    # Remove any deeper headers
+                    keys_to_remove = [k for k in current_headers.keys() if k >= level]
+                    for k in keys_to_remove:
+                        del current_headers[k]
+
+                    current_headers[level] = title
+
+            # Check if we need to start a new chunk
+            # Also fallback on very long single lines that exceed chunk_size
+            if (current_chunk_size + line_len > chunk_size and not in_code_block and current_chunk_lines) or (current_chunk_size > chunk_size and in_code_block):
+                # Format headers for injection
+                header_context = " > ".join(current_headers[k] for k in sorted(current_headers.keys()))
+
+                chunk_text = "\n".join(current_chunk_lines)
+
+                # Prepend header context if we have one and it's not already at the start
+                if header_context and not chunk_text.lstrip().startswith('#'):
+                    chunk_text = f"[{header_context}]\n{chunk_text}"
+
+                if chunk_text.strip():
+                    chunks.append((chunk_text, current_chunk_start))
+
+                # Start new chunk, taking overlap from previous lines
+                overlap_lines = []
+                overlap_size = 0
+                for prev_line in reversed(current_chunk_lines):
+                    if overlap_size + len(prev_line) + 1 > overlap:
+                        break
+                    overlap_lines.insert(0, prev_line)
+                    overlap_size += len(prev_line) + 1
+
+                current_chunk_lines = overlap_lines
+                current_chunk_size = overlap_size
+                # Exact start position is tricky with overlap + headers injected, but we record the true source start
+                current_chunk_start = current_pos - overlap_size
+            elif not current_chunk_lines and line_len > chunk_size:
+                 # extremely long single line without newlines, handle by naive splitting
+                 parts = [line[i:i+chunk_size] for i in range(0, len(line), chunk_size - overlap)]
+                 for part_idx, part in enumerate(parts):
+                     if part.strip():
+                         chunks.append((part, current_pos + part_idx * (chunk_size - overlap)))
+
+                 current_chunk_lines = []
+                 current_chunk_size = 0
+                 current_chunk_start = current_pos + line_len
+                 current_pos += line_len
+                 continue
+
+            if not current_chunk_lines:
+                current_chunk_start = current_pos
+
+            current_chunk_lines.append(line)
+            current_chunk_size += line_len
+            current_pos += line_len
+
+        # Add the last chunk
+        if current_chunk_lines:
+            header_context = " > ".join(current_headers[k] for k in sorted(current_headers.keys()))
+            chunk_text = "\n".join(current_chunk_lines)
+
+            if header_context and not chunk_text.lstrip().startswith('#'):
+                chunk_text = f"[{header_context}]\n{chunk_text}"
+
+            if chunk_text.strip():
+                chunks.append((chunk_text, current_chunk_start))
+
+        # Failsafe for degenerate cases (e.g. tests using non-newline separated text)
+        if len(chunks) == 0 or (len(chunks) == 1 and len(chunks[0][0]) > chunk_size * 1.5):
+            # Fallback to naive
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = start + chunk_size
+                chunk = text[start:end]
+                if chunk.strip():
+                    chunks.append((chunk, start))
+                start += (chunk_size - overlap)
+
         return chunks
     
+    def _ensure_gitignore(self):
+        """Ensure .awesome_index is in .gitignore if .git exists."""
+        git_dir = self.project_root / ".git"
+        if not git_dir.exists() or not git_dir.is_dir():
+            return
+
+        gitignore_path = self.project_root / ".gitignore"
+        index_folder_name = self.index_folder.name
+
+        if gitignore_path.exists():
+            with open(gitignore_path, 'r') as f:
+                content = f.read()
+                if index_folder_name in content:
+                    return
+
+            with open(gitignore_path, 'a') as f:
+                if not content.endswith('\n'):
+                    f.write('\n')
+                f.write(f"\n# AwesomeSearch index\n{index_folder_name}/\n")
+        else:
+            with open(gitignore_path, 'w') as f:
+                f.write(f"# AwesomeSearch index\n{index_folder_name}/\n")
+
     def _get_files_to_index(self, specific_file: Optional[str] = None) -> List[Path]:
         """Get list of files to index."""
         if not self.llms_folder.exists():
@@ -120,6 +244,7 @@ class DocumentSearchEngine:
                 print("All files up to date, no indexing needed")
                 return
         
+        self._ensure_gitignore()
         print(f"Indexing {len(files)} file(s)...")
         
         # Process documents
