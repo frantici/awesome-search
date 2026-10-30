@@ -135,7 +135,7 @@ class TestDocumentSearchEngine:
         assert len(chunks) > 1
         
         # Each chunk should be a tuple (text, position)
-        for chunk_text, position in chunks:
+        for chunk_text, position, langs in chunks:
             assert isinstance(chunk_text, str)
             assert isinstance(position, int)
             assert position >= 0
