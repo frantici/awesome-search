@@ -9,6 +9,7 @@ import numpy as np
 import pickle
 import json
 import hashlib
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import sys
@@ -54,19 +55,77 @@ class DocumentSearchEngine:
     def _chunk_document(self, text: str, chunk_size: int = 500, 
                        overlap: int = 50) -> List[Tuple[str, int]]:
         """
-        Split document into overlapping chunks with character positions.
+        Split document into overlapping chunks with character positions,
+        trying to break at natural boundaries (paragraphs, sentences, words).
         
         Returns:
             List of tuples (chunk_text, start_char_position)
         """
         chunks = []
         start = 0
-        while start < len(text):
+        text_len = len(text)
+
+        while start < text_len:
+            if start + chunk_size >= text_len:
+                chunk = text[start:]
+                if chunk.strip():
+                    chunks.append((chunk, start))
+                break
+
             end = start + chunk_size
+            search_start = max(start, end - int(chunk_size * 0.5))
+
+            break_pos = text.rfind('\n\n', search_start, end)
+            if break_pos != -1:
+                end = break_pos + 2
+            else:
+                break_pos = text.rfind('\n', search_start, end)
+                if break_pos != -1:
+                    end = break_pos + 1
+                else:
+                    matches = list(re.finditer(r'[.!?]\s', text[search_start:end]))
+                    if matches:
+                        end = search_start + matches[-1].end()
+                    else:
+                        break_pos = text.rfind(' ', search_start, end)
+                        if break_pos != -1:
+                            end = break_pos + 1
+
             chunk = text[start:end]
             if chunk.strip():
                 chunks.append((chunk, start))
-            start += (chunk_size - overlap)
+
+            target_start = end - overlap
+
+            if target_start <= start:
+                start = end
+                continue
+
+            search_window_start = max(start + 1, target_start - int(overlap * 0.5))
+            search_window_end = min(end, target_start + int(overlap * 0.5))
+
+            start_pos = text.find('\n\n', search_window_start, search_window_end)
+            if start_pos != -1:
+                start = start_pos + 2
+                continue
+
+            start_pos = text.find('\n', search_window_start, search_window_end)
+            if start_pos != -1:
+                start = start_pos + 1
+                continue
+
+            match = re.search(r'[.!?]\s', text[search_window_start:search_window_end])
+            if match:
+                start = search_window_start + match.end()
+                continue
+
+            start_pos = text.find(' ', search_window_start, search_window_end)
+            if start_pos != -1:
+                start = start_pos + 1
+                continue
+
+            start = target_start
+
         return chunks
     
     def _get_files_to_index(self, specific_file: Optional[str] = None) -> List[Path]:
