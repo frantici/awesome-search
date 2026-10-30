@@ -154,6 +154,29 @@ class DocumentSearchEngine:
 
         return chunks
 
+    def _ensure_gitignore(self):
+        """Ensure .awesome_index is in .gitignore if .git exists."""
+        git_dir = self.project_root / ".git"
+        if not git_dir.exists() or not git_dir.is_dir():
+            return
+
+        gitignore_path = self.project_root / ".gitignore"
+        index_folder_name = self.index_folder.name
+
+        if gitignore_path.exists():
+            with open(gitignore_path, 'r') as f:
+                content = f.read()
+                if index_folder_name in content:
+                    return
+
+            with open(gitignore_path, 'a') as f:
+                if not content.endswith('\n'):
+                    f.write('\n')
+                f.write(f"\n# AwesomeSearch index\n{index_folder_name}/\n")
+        else:
+            with open(gitignore_path, 'w') as f:
+                f.write(f"# AwesomeSearch index\n{index_folder_name}/\n")
+
     def _get_files_to_index(self, specific_file: Optional[str] = None) -> List[Path]:
         """Get list of files to index."""
         if not self.llms_folder.exists():
@@ -205,6 +228,7 @@ class DocumentSearchEngine:
                 print("All files up to date, no indexing needed")
                 return
         
+        self._ensure_gitignore()
         print(f"Indexing {len(files)} file(s)...")
         
         # Process documents
