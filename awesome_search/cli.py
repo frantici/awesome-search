@@ -53,47 +53,68 @@ class DocumentSearchEngine:
             json.dump(hash_log, f, indent=2)
     
     def _chunk_document(self, text: str, chunk_size: int = 500, 
-                       overlap: int = 50) -> List[Tuple[str, int]]:
-        """
+                       overlap: int = 50) -> List[Tuple[str, int, List[str]]]:
+        '''
         Split document into overlapping chunks with character positions,
-        trying to break at natural boundaries (paragraphs, sentences, words).
+        trying to break at natural boundaries (markdown headers, code blocks, paragraphs).
         
         Returns:
-            List of tuples (chunk_text, start_char_position)
-        """
+            List of tuples (chunk_text, start_char_position, languages)
+        '''
         chunks = []
         start = 0
         text_len = len(text)
+
+        def extract_languages(chunk_text: str) -> List[str]:
+            languages = set()
+            for match in re.finditer(r'^[ \t]*```([a-zA-Z0-9_+-]+)[ \t]*$', chunk_text, re.MULTILINE):
+                languages.add(match.group(1).lower())
+            return list(languages)
 
         while start < text_len:
             if start + chunk_size >= text_len:
                 chunk = text[start:]
                 if chunk.strip():
-                    chunks.append((chunk, start))
+                    chunks.append((chunk, start, extract_languages(chunk)))
                 break
 
             end = start + chunk_size
             search_start = max(start, end - int(chunk_size * 0.5))
 
-            break_pos = text.rfind('\n\n', search_start, end)
-            if break_pos != -1:
-                end = break_pos + 2
-            else:
+            break_pos = -1
+
+            num_markers = text.count('```', 0, end)
+            if num_markers % 2 != 0:
+                code_end = text.find('```', end)
+                if code_end != -1 and code_end - start <= chunk_size * 1.5:
+                    end = code_end + 3
+                    search_start = end - 1
+
+            if break_pos == -1:
+                break_pos = text.rfind('\n## ', search_start, end)
+                if break_pos != -1: end = break_pos + 1
+            if break_pos == -1:
+                break_pos = text.rfind('\n# ', search_start, end)
+                if break_pos != -1: end = break_pos + 1
+            if break_pos == -1:
+                break_pos = text.rfind('\n```', search_start, end)
+                if break_pos != -1: end = break_pos + 4
+            if break_pos == -1:
+                break_pos = text.rfind('\n\n', search_start, end)
+                if break_pos != -1: end = break_pos + 2
+            if break_pos == -1:
                 break_pos = text.rfind('\n', search_start, end)
-                if break_pos != -1:
-                    end = break_pos + 1
-                else:
-                    matches = list(re.finditer(r'[.!?]\s', text[search_start:end]))
-                    if matches:
-                        end = search_start + matches[-1].end()
-                    else:
-                        break_pos = text.rfind(' ', search_start, end)
-                        if break_pos != -1:
-                            end = break_pos + 1
+                if break_pos != -1: end = break_pos + 1
+            if break_pos == -1:
+                matches = list(re.finditer(r'[.!?]\s', text[search_start:end]))
+                if matches: end = search_start + matches[-1].end()
+            if break_pos == -1:
+                break_pos = text.rfind(' ', search_start, end)
+                if break_pos != -1: end = break_pos + 1
 
             chunk = text[start:end]
             if chunk.strip():
-                chunks.append((chunk, start))
+                chunks.append((chunk, start, extract_languages(chunk)))
 
             target_start = end - overlap
 
@@ -104,30 +125,35 @@ class DocumentSearchEngine:
             search_window_start = max(start + 1, target_start - int(overlap * 0.5))
             search_window_end = min(end, target_start + int(overlap * 0.5))
 
-            start_pos = text.find('\n\n', search_window_start, search_window_end)
-            if start_pos != -1:
-                start = start_pos + 2
-                continue
+            start_pos = -1
 
-            start_pos = text.find('\n', search_window_start, search_window_end)
-            if start_pos != -1:
-                start = start_pos + 1
-                continue
+            if start_pos == -1:
+                start_pos = text.find('\n## ', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 1
+            if start_pos == -1:
+                start_pos = text.find('\n# ', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 1
+            if start_pos == -1:
+                start_pos = text.find('\n```', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 1
+            if start_pos == -1:
+                start_pos = text.find('\n\n', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 2
+            if start_pos == -1:
+                start_pos = text.find('\n', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 1
+            if start_pos == -1:
+                match = re.search(r'[.!?]\s', text[search_window_start:search_window_end])
+                if match: start = search_window_start + match.end()
+            if start_pos == -1:
+                start_pos = text.find(' ', search_window_start, search_window_end)
+                if start_pos != -1: start = start_pos + 1
 
-            match = re.search(r'[.!?]\s', text[search_window_start:search_window_end])
-            if match:
-                start = search_window_start + match.end()
-                continue
-
-            start_pos = text.find(' ', search_window_start, search_window_end)
-            if start_pos != -1:
-                start = start_pos + 1
-                continue
-
-            start = target_start
+            if start_pos == -1:
+                start = target_start
 
         return chunks
-    
+
     def _get_files_to_index(self, specific_file: Optional[str] = None) -> List[Path]:
         """Get list of files to index."""
         if not self.llms_folder.exists():
@@ -201,14 +227,15 @@ class DocumentSearchEngine:
             # Chunk document with positions
             chunks_with_pos = self._chunk_document(text)
             
-            for i, (chunk, char_pos) in enumerate(chunks_with_pos):
+            for i, (chunk, char_pos, languages) in enumerate(chunks_with_pos):
                 all_chunks.append(chunk)
                 all_metadata.append({
                     'source': file_path.name,
                     'relative_path': relative_path,
                     'chunk_id': i,
                     'total_chunks': len(chunks_with_pos),
-                    'char_position': char_pos
+                    'char_position': char_pos,
+                    'languages': languages
                 })
         
         print(f"Generating embeddings for {len(all_chunks)} chunks...")
@@ -299,7 +326,8 @@ class DocumentSearchEngine:
     
     def search(self, query: str, source_filter: Optional[str] = None, 
                k: int = 5, threshold: float = 0.0,
-               context_mode: bool = False, context_lines: int = 50) -> List[Dict]:
+               context_mode: bool = False, context_lines: int = 50,
+               exclude_languages: Optional[List[str]] = None) -> List[Dict]:
         """
         Search the index.
         
@@ -349,6 +377,11 @@ class DocumentSearchEngine:
             # Apply source filter
             if source_filter and meta['source'] != source_filter:
                 continue
+
+            # Apply exclude languages filter
+            if exclude_languages and 'languages' in meta:
+                if any(lang.lower() in exclude_languages for lang in meta['languages']):
+                    continue
             
             result = {
                 'text': chunks[idx],
@@ -465,6 +498,11 @@ def cmd_search():
         default=50,
         help='Number of lines before/after chunk in context mode (default: 50)'
     )
+    parser.add_argument(
+        '--exclude-lang',
+        action='append',
+        help='Exclude chunks containing these programming languages'
+    )
     
     args = parser.parse_args()
     
@@ -476,13 +514,15 @@ def cmd_search():
     
     try:
         engine = DocumentSearchEngine(project_root)
+        exclude_langs = [lang.lower() for lang in args.exclude_lang] if args.exclude_lang else None
         results = engine.search(
             query=args.query,
             source_filter=args.source,
             k=args.num_results,
             threshold=args.threshold,
             context_mode=args.context,
-            context_lines=args.context_lines
+            context_lines=args.context_lines,
+            exclude_languages=exclude_langs
         )
         
         if not results:
