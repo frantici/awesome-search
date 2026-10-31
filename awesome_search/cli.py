@@ -67,7 +67,7 @@ class DocumentSearchEngine:
 
         def extract_languages(chunk_text: str) -> List[str]:
             languages = set()
-            for match in re.finditer(r'^[ \t]*```([a-zA-Z0-9_+-]+)[ \t]*$', chunk_text, re.MULTILINE):
+            for match in re.finditer(r'^[ \t]*```([a-zA-Z0-9_+-]+)(?:[ \t,].*)?$', chunk_text, re.MULTILINE):
                 languages.add(match.group(1).lower())
             return list(languages)
 

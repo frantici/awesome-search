@@ -424,3 +424,27 @@ class TestVersioning:
         parts = __version__.split(".")
         assert len(parts) >= 2  # At least major.minor
         assert all(part.isdigit() for part in parts)
+
+    def test_extract_languages_from_rust_book(self, search_engine):
+        """Test language extraction specifically from rust book files containing code blocks like ```rust,ignore"""
+        # Create a mock file with the content similar to the Rust book
+        chunk_text = """
+        Some markdown text before the block.
+
+        ```rust,ignore
+        let apples = 5; // immutable
+        let mut bananas = 5; // mutable
+        ```
+
+        Some text after the block.
+        """
+
+        chunks = search_engine._chunk_document(chunk_text)
+
+        rust_found = False
+        for chunk, pos, languages in chunks:
+            if 'rust' in languages:
+                rust_found = True
+                break
+
+        assert rust_found, "Failed to extract 'rust' from rust,ignore code block"
