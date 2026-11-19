@@ -31,7 +31,7 @@ pip install -e .
 
 This installs these global commands:
 - `awesomeIndexer` - Build/update the LLM-doc search index
-- `awesomeSearch` - Search docs (`awesomeSearch <query>`) or code (`awesomeSearch code ...`)
+- `awesomeSearch` - Search docs, code (`awesomeSearch code ...`), or probe env (`awesomeSearch env ...`)
 - `awesomeTUI` - Terminal UI for indexing and searching docs
 - `awesomePrep` - Convert PDF/DOCX/web/markdown into chunk-ready markdown (optional deps: `pip install 'awesome-search[prep]'`)
 
@@ -193,6 +193,8 @@ Index project source as functions/classes with ownership (`mine` / `library`) an
 # Build / refresh the code index (stores under .awesome_index/code/)
 awesomeSearch code index
 awesomeSearch code index --force
+awesomeSearch code purge          # wipe index; keeps path rules
+awesomeSearch code purge --all    # wipe index + rules
 
 # Path ownership rules
 awesomeSearch code rule set "vendor/**" library
@@ -207,9 +209,30 @@ awesomeSearch code search "helper" --language python --path-prefix backend/
 
 # Watch writes and refresh symbol line maps (polling)
 awesomeSearch code watch --poll 1.0
+awesomeSearch code watch --for 30          # auto-stop after 30 minutes
+awesomeSearch code watch stop              # stop permanently
+awesomeSearch code watch stop --minutes 10 # pause 10 min (e.g. during npm update), then resume
+awesomeSearch code watch resume
+awesomeSearch code watch status
 ```
 
 Code mode does not require an `llms/` folder; it uses the nearest `.git` root or the current directory.
+
+## Environment probe
+
+Agents often guess wrong about `python` vs `python3`, venv activation, or missing Node. Probe first:
+
+```bash
+awesomeSearch env                 # detect stacks + tools; exit 2 if critical warnings
+awesomeSearch env detect --json
+awesomeSearch env confirm --yes   # save detection for agents (.awesome_index/env.json)
+awesomeSearch env confirm --yes --python-cmd python3 --node-package-manager npm
+awesomeSearch env set python_cmd .venv/bin/python
+awesomeSearch env show
+awesomeSearch env clear
+```
+
+Detection uses markers like `package.json`, `pyproject.toml`, `requirements.txt`, `Cargo.toml`, `go.mod`, plus PATH checks for interpreters and package managers. If the repo looks Node-heavy and `node` is missing, the probe warns immediately.
 
 ## Tips
 
