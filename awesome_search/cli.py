@@ -595,6 +595,261 @@ def cmd_indexer():
         sys.exit(1)
 
 
+def _print_env_report(report, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+
+    host = report.host or {}
+    shell = host.get("shell") or {}
+    invoke = host.get("invoke") or {}
+
+    print(f"Project root: {report.project_root}")
+    print(f"Detected stacks: {', '.join(report.stacks)}")
+    if report.signals:
+        print(f"Signals: {', '.join(report.signals)}")
+    print()
+    print("Host")
+    print(f"  context       : {host.get('context')}  (os={host.get('os')}, arch={host.get('arch')})")
+    print(f"  shell         : {shell.get('name')}  (family={shell.get('family')})")
+    if host.get("is_wsl") or host.get("wsl_distro"):
+        print(f"  wsl distro    : {host.get('wsl_distro')}")
+    if host.get("wsl_exe"):
+        print(f"  wsl.exe       : {host.get('wsl_exe')}")
+    print(f"  invoke mode   : {invoke.get('mode')}")
+    if invoke.get("bridge"):
+        print(f"  bridge        : {invoke['bridge'].get('pattern')}")
+        print(f"  anti-pattern  : {invoke['bridge'].get('anti_pattern')}")
+    print(f"  script lang   : {report.preferred_script_language}")
+    print()
+    print("Python")
+    print(f"  preferred cmd : {report.python.get('preferred_cmd')}")
+    print(f"  python3       : {report.python.get('python3')}")
+    print(f"  python        : {report.python.get('python')}")
+    print(f"  VIRTUAL_ENV   : {report.python.get('virtual_env_path') or '(inactive)'}")
+    print(f"  local venvs   : {report.python.get('local_venv_dirs') or '(none)'}")
+    print()
+    print("Node")
+    print(f"  package mgr   : {report.node.get('package_manager')}")
+    print(f"  node          : {report.node.get('node')}")
+    print(f"  npm/yarn/pnpm : {[report.node.get(k) for k in ('npm', 'yarn', 'pnpm')]}")
+    print()
+    print(f"Available tools ({len(report.available_tools)}):")
+    print("  " + ", ".join(report.available_tools) if report.available_tools else "  (none)")
+    if report.missing_common_tools:
+        print(f"Missing common: {', '.join(report.missing_common_tools)}")
+    if report.tool_equivalents:
+        # Show a short subset of useful maps for missing tools
+        shown = 0
+        for unix_name in report.missing_common_tools:
+            alts = report.tool_equivalents.get(unix_name)
+            if alts:
+                print(f"  equiv {unix_name} → {', '.join(alts)}")
+                shown += 1
+                if shown >= 8:
+                    break
+    print()
+    if report.agent_rules:
+        print("Agent rules:")
+        for r in report.agent_rules:
+            print(f"  • {r}")
+        print()
+    if report.warnings:
+        print("Warnings:")
+        for w in report.warnings:
+            print(f"  ! {w}")
+        print()
+    if report.recommendations:
+        print("Recommendations:")
+        for r in report.recommendations:
+            print(f"  - {r}")
+        print()
+    if report.confirmed:
+        print("Confirmed overrides (.awesome_index/env.json):")
+        for k, v in report.confirmed.items():
+            if k in {"project_root", "tools", "agent_rules", "available_tools", "warnings_at_confirm"}:
+                continue
+            print(f"  {k}: {v}")
+        conf_tools = (report.confirmed.get("tools") or {})
+        if conf_tools:
+            print(f"  tools ({len(conf_tools)}): {', '.join(sorted(conf_tools))}")
+    else:
+        print("No confirmed env yet. Run: awesomeSearch env confirm --yes")
+
+
+def _cmd_env(argv: List[str]) -> None:
+    """Handle `awesomeSearch env ...`."""
+    from awesome_search.env_probe import EnvStore, confirm_from_probe, probe_environment
+
+    parser = argparse.ArgumentParser(
+        prog="awesomeSearch env",
+        description=(
+            "Detect host/shell (Windows/WSL/Linux), runtimes, and confirmed CLI tools for agents"
+        ),
+    )
+    sub = parser.add_subparsers(dest="env_cmd")
+
+    p_detect = sub.add_parser("detect", help="Probe environment (default)")
+    p_detect.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_confirm = sub.add_parser("confirm", help="Save current detection as confirmed")
+    p_confirm.add_argument("--yes", action="store_true", help="Accept detection without prompts")
+    p_confirm.add_argument("--python-cmd", help="Override interpreter, e.g. python3 or .venv/bin/python")
+    p_confirm.add_argument(
+        "--node-package-manager",
+        choices=["npm", "yarn", "pnpm", "bun"],
+        help="Override node package manager",
+    )
+    p_confirm.add_argument(
+        "--script-language",
+        choices=["py", "ps1", "js", "sh"],
+        help="Preferred language for small helper scripts",
+    )
+
+    p_set = sub.add_parser("set", help="Set one confirmed value")
+    p_set.add_argument(
+        "key",
+        choices=[
+            "python_cmd",
+            "node_package_manager",
+            "virtual_env_path",
+            "preferred_script_language",
+        ],
+        help="Config key",
+    )
+    p_set.add_argument("value", help="Value to store")
+
+    p_tool = sub.add_parser("tool", help="Manage confirmed CLI tool allowlist")
+    tool_sub = p_tool.add_subparsers(dest="tool_cmd", required=True)
+    tool_sub.add_parser("list", help="List confirmed/registered tools")
+    p_tool_add = tool_sub.add_parser(
+        "add",
+        help="Register a tool after verifying it exists (or after install)",
+    )
+    p_tool_add.add_argument("name", help="Tool name, e.g. rg, jq, curl")
+    p_tool_add.add_argument("--path", help="Explicit path to binary")
+    p_tool_add.add_argument(
+        "--after-install",
+        action="store_true",
+        help="Mark source=installed (still requires the binary to resolve)",
+    )
+    p_tool_add.add_argument("--notes", help="Optional note for agents")
+    p_tool_rm = tool_sub.add_parser("remove", help="Remove a registered tool")
+    p_tool_rm.add_argument("name", help="Tool name")
+    p_tool_probe = tool_sub.add_parser(
+        "probe",
+        help="Check if a tool exists; register it if found",
+    )
+    p_tool_probe.add_argument("name", help="Tool name")
+
+    sub.add_parser("show", help="Show confirmed env + fresh detection summary")
+    sub.add_parser("clear", help="Clear confirmed env overrides")
+
+    args = parser.parse_args(argv)
+    project_root = find_project_root(require_llms=False)
+    cmd = args.env_cmd or "detect"
+
+    try:
+        if cmd in {"detect", "show"}:
+            report = probe_environment(project_root)
+            _print_env_report(report, as_json=getattr(args, "json", False))
+            if report.warnings:
+                sys.exit(2)
+            return
+
+        if cmd == "confirm":
+            if not args.yes and sys.stdin.isatty():
+                report = probe_environment(project_root)
+                _print_env_report(report)
+                answer = input("Confirm this environment for agents? [y/N] ").strip().lower()
+                if answer not in {"y", "yes"}:
+                    print("Aborted")
+                    return
+            overrides = {
+                "python_cmd": args.python_cmd,
+                "node_package_manager": args.node_package_manager,
+                "preferred_script_language": args.script_language,
+            }
+            data = confirm_from_probe(project_root, overrides=overrides)
+            print("✓ Confirmed environment saved to .awesome_index/env.json")
+            printable = {
+                k: v
+                for k, v in data.items()
+                if k not in {"warnings_at_confirm", "agent_rules"}
+            }
+            if "tools" in printable:
+                printable["tools"] = sorted(printable["tools"].keys())
+            print(json.dumps(printable, indent=2))
+            if data.get("warnings_at_confirm"):
+                print("\nStill noted at confirm time:")
+                for w in data["warnings_at_confirm"]:
+                    print(f"  ! {w}")
+                sys.exit(2)
+            return
+
+        if cmd == "set":
+            store = EnvStore(project_root)
+            data = store.set_value(args.key, args.value)
+            print(f"✓ Set {args.key}={args.value}")
+            print(json.dumps({k: v for k, v in data.items() if k != "tools"}, indent=2))
+            return
+
+        if cmd == "tool":
+            store = EnvStore(project_root)
+            if args.tool_cmd == "list":
+                tools = store.list_tools()
+                if not tools:
+                    print("(no confirmed tools yet — run env confirm, or env tool add <name>)")
+                    return
+                for name in sorted(tools):
+                    t = tools[name]
+                    print(
+                        f"{name}: path={t.get('path')} source={t.get('source')} "
+                        f"version={t.get('version')}"
+                    )
+                return
+            if args.tool_cmd == "add":
+                source = "installed" if args.after_install else "confirmed"
+                entry = store.add_tool(
+                    args.name,
+                    path=args.path,
+                    source=source,
+                    notes=args.notes,
+                    require_exists=True,
+                )
+                print(f"✓ Registered tool `{args.name}` ({source})")
+                print(json.dumps(entry, indent=2))
+                return
+            if args.tool_cmd == "remove":
+                ok = store.remove_tool(args.name)
+                print("✓ Removed" if ok else "Tool not in allowlist")
+                return
+            if args.tool_cmd == "probe":
+                from awesome_search.env_probe import _tool
+
+                info = _tool(args.name)
+                if not info.available:
+                    print(f"✗ `{args.name}` not found on PATH")
+                    sys.exit(1)
+                entry = store.add_tool(
+                    args.name,
+                    path=info.path,
+                    version=info.version,
+                    source="confirmed",
+                )
+                print(f"✓ Found and registered `{args.name}`")
+                print(json.dumps(entry, indent=2))
+                return
+
+        if cmd == "clear":
+            ok = EnvStore(project_root).clear()
+            print("✓ Cleared" if ok else "Nothing to clear")
+            return
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
 def _cmd_code(argv: List[str]) -> None:
     """Handle `awesomeSearch code ...` subcommands."""
     from awesome_search.code_engine import CodeSearchEngine
@@ -610,8 +865,33 @@ def _cmd_code(argv: List[str]) -> None:
     p_index.add_argument("--force", action="store_true", help="Rebuild even if unchanged")
     p_index.add_argument("--path", default=".", help="Subfolder to index (default: project root)")
 
-    p_watch = sub.add_parser("watch", help="Watch for writes and refresh symbol line maps")
-    p_watch.add_argument("--poll", type=float, default=1.0, help="Poll interval seconds")
+    p_purge = sub.add_parser("purge", help="Delete code index artifacts")
+    p_purge.add_argument(
+        "--all",
+        action="store_true",
+        help="Also delete path rules (default keeps code_rules.json)",
+    )
+
+    p_watch = sub.add_parser("watch", help="Watch / stop / pause / resume code index updates")
+    p_watch.add_argument("--poll", type=float, default=1.0, help="Poll interval seconds (start mode)")
+    p_watch.add_argument(
+        "--for",
+        dest="for_minutes",
+        type=float,
+        help="Auto-stop after N minutes (start mode)",
+    )
+    watch_sub = p_watch.add_subparsers(dest="watch_cmd")
+    p_watch_stop = watch_sub.add_parser(
+        "stop",
+        help="Stop watcher, or pause for N minutes (useful during npm update)",
+    )
+    p_watch_stop.add_argument(
+        "--minutes",
+        type=float,
+        help="Pause for N minutes then auto-resume (omit to stop permanently)",
+    )
+    watch_sub.add_parser("resume", help="Resume a paused watcher")
+    watch_sub.add_parser("status", help="Show watcher status")
 
     p_rule = sub.add_parser("rule", help="Manage path ownership/group rules")
     rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
@@ -663,13 +943,54 @@ def _cmd_code(argv: List[str]) -> None:
                 print(f"  Vector engine: {stats['engine']}")
             return
 
-        if args.code_cmd == "watch":
-            # Ensure an index exists first
-            if not engine.faiss_path.exists():
-                print("No code index yet; building initial index...")
-                engine.index_codebase(force=True)
-            engine.watch(poll_seconds=args.poll)
+        if args.code_cmd == "purge":
+            stats = engine.purge(keep_rules=not args.all)
+            print(
+                f"✓ Purged code index ({stats['removed']} items removed; "
+                f"rules kept={bool(stats['kept_rules'])})"
+            )
             return
+
+        if args.code_cmd == "watch":
+            watch_cmd = getattr(args, "watch_cmd", None)
+            if watch_cmd is None:
+                if not engine.faiss_path.exists():
+                    print("No code index yet; building initial index...")
+                    engine.index_codebase(force=True)
+                engine.watch(
+                    poll_seconds=args.poll,
+                    stop_after_minutes=args.for_minutes,
+                )
+                return
+            if watch_cmd == "stop":
+                result = engine.stop_watch(minutes=args.minutes)
+                if not result.get("ok"):
+                    print("No running code watch found")
+                    sys.exit(1)
+                if result["action"] == "pause":
+                    print(
+                        f"✓ Watch paused for {result['minutes']:g} minute(s); "
+                        "it will resume automatically (re-baselines hashes after pause)"
+                    )
+                else:
+                    print("✓ Stop signal sent to code watch")
+                return
+            if watch_cmd == "resume":
+                result = engine.resume_watch()
+                if not result.get("ok"):
+                    print("No running code watch found")
+                    sys.exit(1)
+                print("✓ Resume signal sent")
+                return
+            if watch_cmd == "status":
+                status = engine._read_watch_status()
+                running = engine.is_watch_running()
+                if not status:
+                    print("Watch: not running")
+                    return
+                print(f"Watch running: {running}")
+                print(json.dumps(status, indent=2))
+                return
 
         if args.code_cmd == "rule":
             if args.rule_cmd == "set":
@@ -735,8 +1056,13 @@ def cmd_search():
         _cmd_code(sys.argv[2:])
         return
 
+    # Environment probe: awesomeSearch env ...
+    if len(sys.argv) > 1 and sys.argv[1] == "env":
+        _cmd_env(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(
-        description='Search LLM instruction documents (or use: awesomeSearch code ...)'
+        description='Search LLM docs, or use: awesomeSearch code ... / awesomeSearch env ...'
     )
     parser.add_argument(
         'query',

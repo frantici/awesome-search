@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
+import shutil
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
@@ -57,6 +59,8 @@ class CodeSearchEngine:
         self.symbols_path = self.code_folder / "symbols.pkl"
         self.faiss_path = self.code_folder / "symbols.faiss"
         self.hash_path = self.code_folder / "file_hashes.json"
+        self.watch_status_path = self.code_folder / "watch.status.json"
+        self.watch_cmd_path = self.code_folder / "watch.cmd.json"
         self.embedding_dim = 384
         self.default_nprobe = 10
         self.rules = CodeRuleStore(self.project_root, self.code_folder)
@@ -383,22 +387,183 @@ class CodeSearchEngine:
                 break
         return results
 
-    # --- watch ----------------------------------------------------------
+    # --- purge ----------------------------------------------------------
 
-    def watch(self, poll_seconds: float = 1.0, stop_after: Optional[float] = None) -> None:
+    def purge(self, keep_rules: bool = True) -> Dict[str, int]:
+        """
+        Delete code index artifacts (FAISS, symbols, hashes, watch state).
+
+        Keeps path rules by default so ownership config survives a rebuild.
+        """
+        removed = 0
+        self.code_folder.mkdir(parents=True, exist_ok=True)
+        keep_names = {"code_rules.json"} if keep_rules else set()
+        for path in list(self.code_folder.iterdir()):
+            if path.name in keep_names:
+                continue
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return {"removed": removed, "kept_rules": int(keep_rules and (self.code_folder / "code_rules.json").exists())}
+
+    # --- watch control --------------------------------------------------
+
+    def _write_watch_status(self, **fields) -> None:
+        self.code_folder.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+            **fields,
+        }
+        with open(self.watch_status_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def _clear_watch_status(self) -> None:
+        if self.watch_status_path.exists():
+            try:
+                self.watch_status_path.unlink()
+            except OSError:
+                pass
+
+    def _read_watch_status(self) -> Optional[Dict]:
+        if not self.watch_status_path.exists():
+            return None
+        try:
+            with open(self.watch_status_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _consume_watch_cmd(self) -> Optional[Dict]:
+        if not self.watch_cmd_path.exists():
+            return None
+        try:
+            with open(self.watch_cmd_path, "r", encoding="utf-8") as f:
+                cmd = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            cmd = None
+        try:
+            self.watch_cmd_path.unlink()
+        except OSError:
+            pass
+        return cmd if isinstance(cmd, dict) else None
+
+    def _send_watch_cmd(self, action: str, **extra) -> Dict:
+        self.code_folder.mkdir(parents=True, exist_ok=True)
+        payload = {"action": action, "sent_at": time.time(), **extra}
+        with open(self.watch_cmd_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    def is_watch_running(self) -> bool:
+        status = self._read_watch_status()
+        if not status:
+            return False
+        pid = status.get("pid")
+        if not isinstance(pid, int):
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def stop_watch(self, minutes: Optional[float] = None) -> Dict:
+        """
+        Signal a running watcher.
+
+        - minutes is None: stop permanently
+        - minutes > 0: pause for that many minutes, then resume automatically
+        """
+        if not self.is_watch_running():
+            return {"ok": False, "reason": "no_running_watch"}
+        if minutes is None:
+            cmd = self._send_watch_cmd("stop")
+            return {"ok": True, "action": "stop", "cmd": cmd}
+        if minutes <= 0:
+            raise ValueError("minutes must be > 0 for a timed pause")
+        cmd = self._send_watch_cmd("pause", minutes=float(minutes))
+        return {"ok": True, "action": "pause", "minutes": float(minutes), "cmd": cmd}
+
+    def resume_watch(self) -> Dict:
+        if not self.is_watch_running():
+            return {"ok": False, "reason": "no_running_watch"}
+        cmd = self._send_watch_cmd("resume")
+        return {"ok": True, "action": "resume", "cmd": cmd}
+
+    def watch(
+        self,
+        poll_seconds: float = 1.0,
+        stop_after: Optional[float] = None,
+        stop_after_minutes: Optional[float] = None,
+    ) -> None:
         """
         Poll for file writes and refresh symbol line maps.
 
-        Uses polling so we avoid a hard watchdog dependency; good enough for v1.
+        Control from another process:
+          awesomeSearch code watch stop
+          awesomeSearch code watch stop --minutes 10   # pause during npm update
+          awesomeSearch code watch resume
         """
+        if stop_after_minutes is not None:
+            stop_after = float(stop_after_minutes) * 60.0
+
         print(f"Watching {self.project_root} for code changes (poll={poll_seconds}s)...")
-        print("Press Ctrl+C to stop.")
+        print("Stop: awesomeSearch code watch stop")
+        print("Pause N min: awesomeSearch code watch stop --minutes N")
+        print("Or Ctrl+C.")
         known = self._load_hashes()
         started = time.time()
+        pause_until: Optional[float] = None
+        self._write_watch_status(state="running", pause_until=None)
         try:
             while True:
-                if stop_after is not None and (time.time() - started) >= stop_after:
+                now = time.time()
+                if stop_after is not None and (now - started) >= stop_after:
+                    print("Reached --for / stop-after limit; exiting watch.")
                     break
+
+                cmd = self._consume_watch_cmd()
+                if cmd:
+                    action = (cmd.get("action") or "").lower()
+                    if action == "stop":
+                        print("Received stop command; exiting watch.")
+                        break
+                    if action == "pause":
+                        minutes = float(cmd.get("minutes") or 0)
+                        pause_until = time.time() + max(0.0, minutes) * 60.0
+                        print(f"Paused for {minutes:g} minute(s); will resume automatically.")
+                        self._write_watch_status(state="paused", pause_until=pause_until)
+                    elif action == "resume":
+                        pause_until = None
+                        print("Resumed watching.")
+                        self._write_watch_status(state="running", pause_until=None)
+
+                if pause_until is not None:
+                    if time.time() < pause_until:
+                        remaining = pause_until - time.time()
+                        self._write_watch_status(state="paused", pause_until=pause_until)
+                        time.sleep(min(poll_seconds, max(0.2, remaining)))
+                        continue
+                    print("Pause ended; resuming watch.")
+                    pause_until = None
+                    # Re-baseline hashes so a burst of npm/vendor writes during
+                    # the pause does not flood refresh on resume.
+                    known = {}
+                    for path in self._iter_source_files():
+                        rel = str(path.relative_to(self.project_root)).replace("\\", "/")
+                        try:
+                            known[rel] = self._file_hash(path)
+                        except OSError:
+                            continue
+                    self._save_hashes(known)
+                    self._write_watch_status(state="running", pause_until=None)
+
                 current: Dict[str, str] = {}
                 for path in self._iter_source_files():
                     rel = str(path.relative_to(self.project_root)).replace("\\", "/")
@@ -429,6 +594,14 @@ class CodeSearchEngine:
                                 self.faiss_path.unlink()
                         self._save_hashes(hashes)
                 known = current
+                self._write_watch_status(state="running", pause_until=None)
                 time.sleep(poll_seconds)
         except KeyboardInterrupt:
             print("\nStopped watching.")
+        finally:
+            self._clear_watch_status()
+            if self.watch_cmd_path.exists():
+                try:
+                    self.watch_cmd_path.unlink()
+                except OSError:
+                    pass

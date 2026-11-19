@@ -31,7 +31,7 @@ pip install -e .
 
 This installs these global commands:
 - `awesomeIndexer` - Build/update the LLM-doc search index
-- `awesomeSearch` - Search docs (`awesomeSearch <query>`) or code (`awesomeSearch code ...`)
+- `awesomeSearch` - Search docs, code (`awesomeSearch code ...`), or probe env (`awesomeSearch env ...`)
 - `awesomeTUI` - Terminal UI for indexing and searching docs
 - `awesomePrep` - Convert PDF/DOCX/web/markdown into chunk-ready markdown (optional deps: `pip install 'awesome-search[prep]'`)
 
@@ -193,6 +193,8 @@ Index project source as functions/classes with ownership (`mine` / `library`) an
 # Build / refresh the code index (stores under .awesome_index/code/)
 awesomeSearch code index
 awesomeSearch code index --force
+awesomeSearch code purge          # wipe index; keeps path rules
+awesomeSearch code purge --all    # wipe index + rules
 
 # Path ownership rules
 awesomeSearch code rule set "vendor/**" library
@@ -207,9 +209,44 @@ awesomeSearch code search "helper" --language python --path-prefix backend/
 
 # Watch writes and refresh symbol line maps (polling)
 awesomeSearch code watch --poll 1.0
+awesomeSearch code watch --for 30          # auto-stop after 30 minutes
+awesomeSearch code watch stop              # stop permanently
+awesomeSearch code watch stop --minutes 10 # pause 10 min (e.g. during npm update), then resume
+awesomeSearch code watch resume
+awesomeSearch code watch status
 ```
 
 Code mode does not require an `llms/` folder; it uses the nearest `.git` root or the current directory.
+
+## Environment probe
+
+Agents often guess wrong about **Windows vs WSL vs bash**, `python` vs `python3`, venvs, or missing CLI tools. Probe first:
+
+```bash
+awesomeSearch env                 # host/shell/tools + agent rules; exit 2 on warnings
+awesomeSearch env detect --json
+awesomeSearch env confirm --yes   # snapshot allowlist into .awesome_index/env.json
+awesomeSearch env confirm --yes --python-cmd python3 --script-language py
+awesomeSearch env set preferred_script_language py
+
+# Grow the tool allowlist after you verify/install something
+awesomeSearch env tool probe rg
+awesomeSearch env tool add jq --after-install
+awesomeSearch env tool list
+awesomeSearch env tool remove jq
+
+awesomeSearch env show
+awesomeSearch env clear
+```
+
+Detection covers:
+
+- **Host context**: `windows` / `wsl` / `linux` / `macos`, shell family (`powershell`, `bash`, …)
+- **Invoke rules**: e.g. on Windows+WSL — write a file, then `wsl.exe -d Distro -- python3 /path` (not nested bash in PowerShell)
+- **Runtimes**: python/python3/py, node package managers, venv
+- **CLI allowlist**: probed common tools (`rg`, `grep`, `curl`, `jq`, `wc`, `sed`, …) with Windows equivalents where relevant
+
+See **`skills.md`** for the default agent playbook (run env first, respect `available_tools`, register tools after install).
 
 ## Tips
 
