@@ -29,9 +29,11 @@ cd awesome-search
 pip install -e .
 ```
 
-This installs two global commands:
+This installs these global commands:
 - `awesomeIndexer` - Build/update the search index
 - `awesomeSearch` - Search the index
+- `awesomeTUI` - Terminal UI for indexing and searching
+- `awesomePrep` - Convert PDF/DOCX/web/markdown into chunk-ready markdown (optional deps: `pip install 'awesome-search[prep]'`)
 
 ## Usage
 

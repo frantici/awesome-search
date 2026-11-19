@@ -408,6 +408,34 @@ class TestEmbeddings:
         assert sim_python > sim_different
 
 
+class TestGitignoreAutomation:
+    """Test auto-adding .awesome_index to .gitignore."""
+
+    def test_ensure_gitignore_creates_file(self, search_engine, temp_project):
+        """Indexer should create .gitignore with .awesome_index when .git exists."""
+        (temp_project / ".git").mkdir()
+        gitignore = temp_project / ".gitignore"
+        assert not gitignore.exists()
+
+        search_engine._ensure_gitignore()
+
+        content = gitignore.read_text()
+        assert ".awesome_index" in content
+
+    def test_ensure_gitignore_appends_once(self, search_engine, temp_project):
+        """Existing .gitignore should gain .awesome_index only once."""
+        (temp_project / ".git").mkdir()
+        gitignore = temp_project / ".gitignore"
+        gitignore.write_text("node_modules/\n")
+
+        search_engine._ensure_gitignore()
+        search_engine._ensure_gitignore()
+
+        content = gitignore.read_text()
+        assert content.count(".awesome_index") == 1
+        assert "node_modules/" in content
+
+
 class TestFaissEMeansEngine:
     """Test suite for FAISS IVF + e-means as the primary vector engine."""
 
