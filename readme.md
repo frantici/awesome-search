@@ -220,19 +220,33 @@ Code mode does not require an `llms/` folder; it uses the nearest `.git` root or
 
 ## Environment probe
 
-Agents often guess wrong about `python` vs `python3`, venv activation, or missing Node. Probe first:
+Agents often guess wrong about **Windows vs WSL vs bash**, `python` vs `python3`, venvs, or missing CLI tools. Probe first:
 
 ```bash
-awesomeSearch env                 # detect stacks + tools; exit 2 if critical warnings
+awesomeSearch env                 # host/shell/tools + agent rules; exit 2 on warnings
 awesomeSearch env detect --json
-awesomeSearch env confirm --yes   # save detection for agents (.awesome_index/env.json)
-awesomeSearch env confirm --yes --python-cmd python3 --node-package-manager npm
-awesomeSearch env set python_cmd .venv/bin/python
+awesomeSearch env confirm --yes   # snapshot allowlist into .awesome_index/env.json
+awesomeSearch env confirm --yes --python-cmd python3 --script-language py
+awesomeSearch env set preferred_script_language py
+
+# Grow the tool allowlist after you verify/install something
+awesomeSearch env tool probe rg
+awesomeSearch env tool add jq --after-install
+awesomeSearch env tool list
+awesomeSearch env tool remove jq
+
 awesomeSearch env show
 awesomeSearch env clear
 ```
 
-Detection uses markers like `package.json`, `pyproject.toml`, `requirements.txt`, `Cargo.toml`, `go.mod`, plus PATH checks for interpreters and package managers. If the repo looks Node-heavy and `node` is missing, the probe warns immediately.
+Detection covers:
+
+- **Host context**: `windows` / `wsl` / `linux` / `macos`, shell family (`powershell`, `bash`, …)
+- **Invoke rules**: e.g. on Windows+WSL — write a file, then `wsl.exe -d Distro -- python3 /path` (not nested bash in PowerShell)
+- **Runtimes**: python/python3/py, node package managers, venv
+- **CLI allowlist**: probed common tools (`rg`, `grep`, `curl`, `jq`, `wc`, `sed`, …) with Windows equivalents where relevant
+
+See **`skills.md`** for the default agent playbook (run env first, respect `available_tools`, register tools after install).
 
 ## Tips
 

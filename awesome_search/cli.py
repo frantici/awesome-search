@@ -600,10 +600,27 @@ def _print_env_report(report, as_json: bool = False) -> None:
         print(json.dumps(report.to_dict(), indent=2))
         return
 
+    host = report.host or {}
+    shell = host.get("shell") or {}
+    invoke = host.get("invoke") or {}
+
     print(f"Project root: {report.project_root}")
     print(f"Detected stacks: {', '.join(report.stacks)}")
     if report.signals:
         print(f"Signals: {', '.join(report.signals)}")
+    print()
+    print("Host")
+    print(f"  context       : {host.get('context')}  (os={host.get('os')}, arch={host.get('arch')})")
+    print(f"  shell         : {shell.get('name')}  (family={shell.get('family')})")
+    if host.get("is_wsl") or host.get("wsl_distro"):
+        print(f"  wsl distro    : {host.get('wsl_distro')}")
+    if host.get("wsl_exe"):
+        print(f"  wsl.exe       : {host.get('wsl_exe')}")
+    print(f"  invoke mode   : {invoke.get('mode')}")
+    if invoke.get("bridge"):
+        print(f"  bridge        : {invoke['bridge'].get('pattern')}")
+        print(f"  anti-pattern  : {invoke['bridge'].get('anti_pattern')}")
+    print(f"  script lang   : {report.preferred_script_language}")
     print()
     print("Python")
     print(f"  preferred cmd : {report.python.get('preferred_cmd')}")
@@ -617,6 +634,26 @@ def _print_env_report(report, as_json: bool = False) -> None:
     print(f"  node          : {report.node.get('node')}")
     print(f"  npm/yarn/pnpm : {[report.node.get(k) for k in ('npm', 'yarn', 'pnpm')]}")
     print()
+    print(f"Available tools ({len(report.available_tools)}):")
+    print("  " + ", ".join(report.available_tools) if report.available_tools else "  (none)")
+    if report.missing_common_tools:
+        print(f"Missing common: {', '.join(report.missing_common_tools)}")
+    if report.tool_equivalents:
+        # Show a short subset of useful maps for missing tools
+        shown = 0
+        for unix_name in report.missing_common_tools:
+            alts = report.tool_equivalents.get(unix_name)
+            if alts:
+                print(f"  equiv {unix_name} → {', '.join(alts)}")
+                shown += 1
+                if shown >= 8:
+                    break
+    print()
+    if report.agent_rules:
+        print("Agent rules:")
+        for r in report.agent_rules:
+            print(f"  • {r}")
+        print()
     if report.warnings:
         print("Warnings:")
         for w in report.warnings:
@@ -630,9 +667,12 @@ def _print_env_report(report, as_json: bool = False) -> None:
     if report.confirmed:
         print("Confirmed overrides (.awesome_index/env.json):")
         for k, v in report.confirmed.items():
-            if k == "project_root":
+            if k in {"project_root", "tools", "agent_rules", "available_tools", "warnings_at_confirm"}:
                 continue
             print(f"  {k}: {v}")
+        conf_tools = (report.confirmed.get("tools") or {})
+        if conf_tools:
+            print(f"  tools ({len(conf_tools)}): {', '.join(sorted(conf_tools))}")
     else:
         print("No confirmed env yet. Run: awesomeSearch env confirm --yes")
 
@@ -643,7 +683,9 @@ def _cmd_env(argv: List[str]) -> None:
 
     parser = argparse.ArgumentParser(
         prog="awesomeSearch env",
-        description="Detect project runtimes (python/python3, venv, node, …) and confirm for agents",
+        description=(
+            "Detect host/shell (Windows/WSL/Linux), runtimes, and confirmed CLI tools for agents"
+        ),
     )
     sub = parser.add_subparsers(dest="env_cmd")
 
@@ -658,14 +700,47 @@ def _cmd_env(argv: List[str]) -> None:
         choices=["npm", "yarn", "pnpm", "bun"],
         help="Override node package manager",
     )
+    p_confirm.add_argument(
+        "--script-language",
+        choices=["py", "ps1", "js", "sh"],
+        help="Preferred language for small helper scripts",
+    )
 
     p_set = sub.add_parser("set", help="Set one confirmed value")
     p_set.add_argument(
         "key",
-        choices=["python_cmd", "node_package_manager", "virtual_env_path"],
+        choices=[
+            "python_cmd",
+            "node_package_manager",
+            "virtual_env_path",
+            "preferred_script_language",
+        ],
         help="Config key",
     )
     p_set.add_argument("value", help="Value to store")
+
+    p_tool = sub.add_parser("tool", help="Manage confirmed CLI tool allowlist")
+    tool_sub = p_tool.add_subparsers(dest="tool_cmd", required=True)
+    tool_sub.add_parser("list", help="List confirmed/registered tools")
+    p_tool_add = tool_sub.add_parser(
+        "add",
+        help="Register a tool after verifying it exists (or after install)",
+    )
+    p_tool_add.add_argument("name", help="Tool name, e.g. rg, jq, curl")
+    p_tool_add.add_argument("--path", help="Explicit path to binary")
+    p_tool_add.add_argument(
+        "--after-install",
+        action="store_true",
+        help="Mark source=installed (still requires the binary to resolve)",
+    )
+    p_tool_add.add_argument("--notes", help="Optional note for agents")
+    p_tool_rm = tool_sub.add_parser("remove", help="Remove a registered tool")
+    p_tool_rm.add_argument("name", help="Tool name")
+    p_tool_probe = tool_sub.add_parser(
+        "probe",
+        help="Check if a tool exists; register it if found",
+    )
+    p_tool_probe.add_argument("name", help="Tool name")
 
     sub.add_parser("show", help="Show confirmed env + fresh detection summary")
     sub.add_parser("clear", help="Clear confirmed env overrides")
@@ -693,10 +768,18 @@ def _cmd_env(argv: List[str]) -> None:
             overrides = {
                 "python_cmd": args.python_cmd,
                 "node_package_manager": args.node_package_manager,
+                "preferred_script_language": args.script_language,
             }
             data = confirm_from_probe(project_root, overrides=overrides)
             print("✓ Confirmed environment saved to .awesome_index/env.json")
-            print(json.dumps({k: v for k, v in data.items() if k != "warnings_at_confirm"}, indent=2))
+            printable = {
+                k: v
+                for k, v in data.items()
+                if k not in {"warnings_at_confirm", "agent_rules"}
+            }
+            if "tools" in printable:
+                printable["tools"] = sorted(printable["tools"].keys())
+            print(json.dumps(printable, indent=2))
             if data.get("warnings_at_confirm"):
                 print("\nStill noted at confirm time:")
                 for w in data["warnings_at_confirm"]:
@@ -708,8 +791,55 @@ def _cmd_env(argv: List[str]) -> None:
             store = EnvStore(project_root)
             data = store.set_value(args.key, args.value)
             print(f"✓ Set {args.key}={args.value}")
-            print(json.dumps(data, indent=2))
+            print(json.dumps({k: v for k, v in data.items() if k != "tools"}, indent=2))
             return
+
+        if cmd == "tool":
+            store = EnvStore(project_root)
+            if args.tool_cmd == "list":
+                tools = store.list_tools()
+                if not tools:
+                    print("(no confirmed tools yet — run env confirm, or env tool add <name>)")
+                    return
+                for name in sorted(tools):
+                    t = tools[name]
+                    print(
+                        f"{name}: path={t.get('path')} source={t.get('source')} "
+                        f"version={t.get('version')}"
+                    )
+                return
+            if args.tool_cmd == "add":
+                source = "installed" if args.after_install else "confirmed"
+                entry = store.add_tool(
+                    args.name,
+                    path=args.path,
+                    source=source,
+                    notes=args.notes,
+                    require_exists=True,
+                )
+                print(f"✓ Registered tool `{args.name}` ({source})")
+                print(json.dumps(entry, indent=2))
+                return
+            if args.tool_cmd == "remove":
+                ok = store.remove_tool(args.name)
+                print("✓ Removed" if ok else "Tool not in allowlist")
+                return
+            if args.tool_cmd == "probe":
+                from awesome_search.env_probe import _tool
+
+                info = _tool(args.name)
+                if not info.available:
+                    print(f"✗ `{args.name}` not found on PATH")
+                    sys.exit(1)
+                entry = store.add_tool(
+                    args.name,
+                    path=info.path,
+                    version=info.version,
+                    source="confirmed",
+                )
+                print(f"✓ Found and registered `{args.name}`")
+                print(json.dumps(entry, indent=2))
+                return
 
         if cmd == "clear":
             ok = EnvStore(project_root).clear()

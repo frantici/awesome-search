@@ -121,6 +121,10 @@ class TestEnvProbe:
         assert report.python.get("preferred_cmd") in {"python3", "python"} or (
             report.python.get("preferred_cmd") or ""
         ).endswith("python")
+        assert report.host.get("context") in {"linux", "macos", "wsl", "windows"}
+        assert report.preferred_script_language in {"py", "ps1", "js", "sh"}
+        assert isinstance(report.available_tools, list)
+        assert report.agent_rules
 
     def test_warns_when_node_missing(self, temp_project):
         (temp_project / "package.json").write_text('{"name":"demo"}')
@@ -130,10 +134,38 @@ class TestEnvProbe:
         assert "node" in report.stacks
         assert any("node" in w.lower() for w in report.warnings)
 
+    def test_windows_powershell_rules(self, temp_project):
+        fake_host = {
+            "os": "Windows",
+            "os_release": "10",
+            "arch": "AMD64",
+            "context": "windows",
+            "is_wsl": False,
+            "wsl_distro": None,
+            "wsl_exe": "C:\\Windows\\System32\\wsl.exe",
+            "shell": {"name": "powershell", "family": "powershell"},
+            "invoke": {
+                "mode": "windows_with_wsl",
+                "bridge": {
+                    "pattern": "write file then wsl.exe",
+                    "anti_pattern": "no nested bash in powershell",
+                },
+            },
+            "python_runtime": "C:\\Python\\python.exe",
+            "platform": "Windows",
+        }
+        with patch("awesome_search.env_probe._detect_host", return_value=fake_host):
+            report = probe_environment(temp_project)
+        assert report.host["context"] == "windows"
+        assert any("PowerShell" in w for w in report.warnings)
+        assert any("wsl.exe" in r.lower() or "WSL" in r for r in report.recommendations + report.agent_rules)
+
     def test_confirm_and_set(self, temp_project):
         (temp_project / "requirements.txt").write_text("numpy\n")
         data = confirm_from_probe(temp_project, overrides={"python_cmd": "python3"})
         assert data["python_cmd"] == "python3"
+        assert "tools" in data
+        assert "available_tools" in data
         store = EnvStore(temp_project)
         store.set_value("node_package_manager", "pnpm")
         loaded = store.load()
@@ -141,6 +173,27 @@ class TestEnvProbe:
         report = probe_environment(temp_project)
         assert report.confirmed["python_cmd"] == "python3"
         assert report.node["package_manager"] == "pnpm"
+
+    def test_tool_add_probe_remove(self, temp_project):
+        store = EnvStore(temp_project)
+        # python3 should exist in this CI/dev image
+        entry = store.add_tool("python3", source="confirmed")
+        assert entry["available"] is True
+        assert "python3" in store.list_tools()
+
+        with pytest.raises(FileNotFoundError):
+            store.add_tool("definitely-not-a-real-cli-tool-xyz", require_exists=True)
+
+        assert store.remove_tool("python3") is True
+        assert "python3" not in store.list_tools()
+
+    def test_tool_add_after_install_marks_source(self, temp_project):
+        store = EnvStore(temp_project)
+        entry = store.add_tool("python3", source="installed")
+        assert entry["source"] == "installed"
+        report = probe_environment(temp_project)
+        assert report.tools["python3"]["source"] in {"installed", "confirmed", "probe"}
+        assert "python3" in report.available_tools
 
     def test_clear(self, temp_project):
         store = EnvStore(temp_project)
