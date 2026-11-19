@@ -6,8 +6,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="awesome-search",
-    version="0.8.0",
-    description="Local FAISS IVF e-means search tool for LLM instruction documents",
+    version="0.9.0",
+    description="Local FAISS IVF e-means search for LLM docs and code symbols",
     author="Trym K. Bjerkan",
     packages=find_packages(),
     install_requires=[

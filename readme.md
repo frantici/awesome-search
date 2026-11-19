@@ -30,9 +30,9 @@ pip install -e .
 ```
 
 This installs these global commands:
-- `awesomeIndexer` - Build/update the search index
-- `awesomeSearch` - Search the index
-- `awesomeTUI` - Terminal UI for indexing and searching
+- `awesomeIndexer` - Build/update the LLM-doc search index
+- `awesomeSearch` - Search docs (`awesomeSearch <query>`) or code (`awesomeSearch code ...`)
+- `awesomeTUI` - Terminal UI for indexing and searching docs
 - `awesomePrep` - Convert PDF/DOCX/web/markdown into chunk-ready markdown (optional deps: `pip install 'awesome-search[prep]'`)
 
 ## Usage
@@ -185,9 +185,36 @@ The hash log (`.awesome_index/file_hashes.json`) tracks file changes:
 }
 ```
 
+## Code symbol index
+
+Index project source as functions/classes with ownership (`mine` / `library`) and group tags (`frontend`, `backend`, `frontend_library`, `backend_library`, `shared`, `tooling`). Defaults treat `node_modules/`, `vendor/`, `.venv/`, etc. as library, and also honor directory hints from `.gitignore`. Explicit path rules override defaults.
+
+```bash
+# Build / refresh the code index (stores under .awesome_index/code/)
+awesomeSearch code index
+awesomeSearch code index --force
+
+# Path ownership rules
+awesomeSearch code rule set "vendor/**" library
+awesomeSearch code rule set "vendor/mycompany/**" mine --group backend
+awesomeSearch code rule list
+awesomeSearch code rule remove "vendor/**"
+
+# Search with filters (agent-friendly)
+awesomeSearch code search "create user" --mine
+awesomeSearch code search "button component" --group frontend --exclude-group frontend_library
+awesomeSearch code search "helper" --language python --path-prefix backend/
+
+# Watch writes and refresh symbol line maps (polling)
+awesomeSearch code watch --poll 1.0
+```
+
+Code mode does not require an `llms/` folder; it uses the nearest `.git` root or the current directory.
+
 ## Tips
 
 - **Supported formats**: .md, .txt, .mdx files in the llms folder
+- **Code formats**: `.py`, `.ts`/`.tsx`, `.js`/`.jsx`, `.rs`, `.go`, `.java`, and related source extensions
 - **Chunk size**: Documents are split into 500-character chunks with 50-character overlap
 - **Embeddings**: Uses `all-MiniLM-L6-v2` (fast, 384 dimensions)
 - **Vector engine**: FAISS IVF Flat with e-means training (`nlist ≈ 4√N`, 5 epochs); `nprobe` defaults to 10
