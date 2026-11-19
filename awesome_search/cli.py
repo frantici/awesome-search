@@ -538,18 +538,25 @@ class DocumentSearchEngine:
         return results
 
 
-def find_project_root() -> Optional[Path]:
-    """Find project root by looking for llms folder in current or parent directories."""
+def find_project_root(require_llms: bool = True) -> Optional[Path]:
+    """
+    Find project root.
+
+    Doc mode prefers an `llms/` folder. Code mode also accepts `.git` or CWD.
+    """
     current = Path.cwd()
-    
-    # Check current directory and up to 5 levels up
+
     for _ in range(6):
         if (current / "llms").exists():
+            return current
+        if not require_llms and (current / ".git").exists():
             return current
         if current.parent == current:
             break
         current = current.parent
-    
+
+    if not require_llms:
+        return Path.cwd()
     return None
 
 
@@ -572,7 +579,7 @@ def cmd_indexer():
     args = parser.parse_args()
     
     # Find project root
-    project_root = find_project_root()
+    project_root = find_project_root(require_llms=True)
     if not project_root:
         print("Error: No 'llms' folder found in current directory or parent directories")
         print("Make sure you're running this from within a project with an 'llms' folder")
@@ -588,10 +595,148 @@ def cmd_indexer():
         sys.exit(1)
 
 
+def _cmd_code(argv: List[str]) -> None:
+    """Handle `awesomeSearch code ...` subcommands."""
+    from awesome_search.code_engine import CodeSearchEngine
+    from awesome_search.code_classify import VALID_GROUPS
+
+    parser = argparse.ArgumentParser(
+        prog="awesomeSearch code",
+        description="Code symbol index: ownership/group-aware search and watch",
+    )
+    sub = parser.add_subparsers(dest="code_cmd", required=True)
+
+    p_index = sub.add_parser("index", help="Index project source symbols")
+    p_index.add_argument("--force", action="store_true", help="Rebuild even if unchanged")
+    p_index.add_argument("--path", default=".", help="Subfolder to index (default: project root)")
+
+    p_watch = sub.add_parser("watch", help="Watch for writes and refresh symbol line maps")
+    p_watch.add_argument("--poll", type=float, default=1.0, help="Poll interval seconds")
+
+    p_rule = sub.add_parser("rule", help="Manage path ownership/group rules")
+    rule_sub = p_rule.add_subparsers(dest="rule_cmd", required=True)
+    p_rule_set = rule_sub.add_parser("set", help="Set a path rule")
+    p_rule_set.add_argument("pattern", help='Path pattern, e.g. "vendor/**" or "vendor/mycompany/**"')
+    p_rule_set.add_argument(
+        "ownership",
+        choices=["mine", "library", "unknown"],
+        help="Ownership label",
+    )
+    p_rule_set.add_argument(
+        "--group",
+        choices=sorted(VALID_GROUPS),
+        help="Optional group override",
+    )
+    p_rule_rm = rule_sub.add_parser("remove", help="Remove a path rule")
+    p_rule_rm.add_argument("pattern", help="Exact pattern to remove")
+    rule_sub.add_parser("list", help="List path rules")
+
+    p_search = sub.add_parser("search", help="Search the code symbol index")
+    p_search.add_argument("query", help="Natural language / keyword query")
+    p_search.add_argument("-k", "--num-results", type=int, default=10)
+    p_search.add_argument("--mine", action="store_true", help="Only symbols owned by 'mine'")
+    p_search.add_argument("--ownership", choices=["mine", "library", "unknown"])
+    p_search.add_argument("--group", choices=sorted(VALID_GROUPS))
+    p_search.add_argument(
+        "--exclude-group",
+        action="append",
+        default=[],
+        help="Exclude group(s), e.g. frontend_library",
+    )
+    p_search.add_argument("--language", help="Filter by language, e.g. typescript")
+    p_search.add_argument("--path-prefix", help="Only paths under this prefix")
+
+    args = parser.parse_args(argv)
+    project_root = find_project_root(require_llms=False)
+    engine = CodeSearchEngine(project_root)
+    print(f"Project root: {project_root}")
+
+    try:
+        if args.code_cmd == "index":
+            root = (project_root / args.path).resolve()
+            stats = engine.index_codebase(root=root, force=args.force)
+            print(
+                f"✓ Code index: {stats['symbols']} symbols from {stats['files']} files "
+                f"(changed={stats['changed']}, reused={stats['reused']})"
+            )
+            if stats.get("engine"):
+                print(f"  Vector engine: {stats['engine']}")
+            return
+
+        if args.code_cmd == "watch":
+            # Ensure an index exists first
+            if not engine.faiss_path.exists():
+                print("No code index yet; building initial index...")
+                engine.index_codebase(force=True)
+            engine.watch(poll_seconds=args.poll)
+            return
+
+        if args.code_cmd == "rule":
+            if args.rule_cmd == "set":
+                rule = engine.rules.set_rule(args.pattern, args.ownership, args.group)
+                print(f"✓ Rule set: {rule.pattern} -> ownership={rule.ownership}", end="")
+                if rule.group:
+                    print(f", group={rule.group}")
+                else:
+                    print()
+                return
+            if args.rule_cmd == "remove":
+                ok = engine.rules.remove_rule(args.pattern)
+                print("✓ Removed" if ok else "No matching rule")
+                return
+            if args.rule_cmd == "list":
+                rules = engine.rules.list_rules()
+                if not rules:
+                    print("(no explicit rules; defaults + .gitignore hints apply)")
+                    return
+                for rule in rules:
+                    extra = f", group={rule.group}" if rule.group else ""
+                    print(f"{rule.pattern} -> {rule.ownership}{extra}")
+                return
+
+        if args.code_cmd == "search":
+            results = engine.search(
+                query=args.query,
+                k=args.num_results,
+                ownership=args.ownership,
+                group=args.group,
+                exclude_groups=args.exclude_group,
+                language=args.language,
+                path_prefix=args.path_prefix,
+                mine_only=args.mine,
+            )
+            if not results:
+                print("No results found")
+                return
+            print(f"\nFound {len(results)} code symbol(s):\n")
+            print("=" * 80)
+            for i, r in enumerate(results, 1):
+                print(f"\n[Result {i}] Score: {r['score']:.4f}")
+                print(
+                    f"{r['kind']} {r['name']}  ({r['language']})  "
+                    f"ownership={r['ownership']}  group={r['group']}"
+                )
+                print(f"Path: {r['path']}:{r['start_line']}-{r['end_line']}")
+                if r.get("signature"):
+                    print(f"Sig:  {r['signature']}")
+                print("-" * 80)
+                print(r.get("context") or "")
+                print("=" * 80)
+            return
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+
 def cmd_search():
     """Entry point for awesomeSearch command."""
+    # Code-index mode: awesomeSearch code ...
+    if len(sys.argv) > 1 and sys.argv[1] == "code":
+        _cmd_code(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(
-        description='Search LLM instruction documents'
+        description='Search LLM instruction documents (or use: awesomeSearch code ...)'
     )
     parser.add_argument(
         'query',
@@ -636,7 +781,7 @@ def cmd_search():
     args = parser.parse_args()
     
     # Find project root
-    project_root = find_project_root()
+    project_root = find_project_root(require_llms=True)
     if not project_root:
         print("Error: No 'llms' folder found in current directory or parent directories")
         sys.exit(1)
