@@ -6,8 +6,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="awesome-search",
-    version="0.6.0",
-    description="Local FAISS-based search tool for LLM instruction documents",
+    version="0.7.0",
+    description="Local FAISS IVF k-means search tool for LLM instruction documents",
     author="Trym K. Bjerkan",
     packages=find_packages(),
     install_requires=[

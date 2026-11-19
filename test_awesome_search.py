@@ -408,6 +408,90 @@ class TestEmbeddings:
         assert sim_python > sim_different
 
 
+class TestFaissKMeansEngine:
+    """Test suite for FAISS IVF + k-means as the primary vector engine."""
+
+    def test_choose_nlist_scales_with_corpus(self, search_engine):
+        """nlist should grow with corpus size but stay within FAISS limits."""
+        assert search_engine._choose_nlist(10) == 1
+        nlist = search_engine._choose_nlist(400)
+        assert 1 <= nlist <= 400
+        assert nlist == int(4 * np.sqrt(400)) or nlist == 400 // 39
+
+    def test_build_falls_back_to_flat_for_small_corpus(self, search_engine):
+        """Tiny corpora use Flat L2 until IVF k-means can be trained."""
+        rng = np.random.default_rng(0)
+        embeddings = rng.standard_normal(
+            (10, search_engine.embedding_dim)
+        ).astype("float32")
+        index, meta = search_engine._build_faiss_index(embeddings)
+
+        assert meta["engine"] == DocumentSearchEngine.FALLBACK_ENGINE
+        assert index.ntotal == 10
+        assert not hasattr(index, "nlist") or getattr(index, "nlist", 0) == 0
+
+    def test_build_uses_ivf_kmeans_as_primary(self, search_engine):
+        """Primary engine should be IndexIVFFlat trained with k-means."""
+        import faiss
+
+        rng = np.random.default_rng(42)
+        num_vectors = 80
+        embeddings = rng.standard_normal(
+            (num_vectors, search_engine.embedding_dim)
+        ).astype("float32")
+        index, meta = search_engine._build_faiss_index(embeddings)
+
+        assert meta["engine"] == DocumentSearchEngine.PRIMARY_ENGINE
+        assert meta["nlist"] >= 1
+        assert meta["nprobe"] >= 1
+        assert index.ntotal == num_vectors
+        assert isinstance(index, faiss.IndexIVFFlat)
+        assert index.is_trained
+        assert index.nlist == meta["nlist"]
+
+    def test_ivf_kmeans_search_returns_neighbors(self, search_engine):
+        """IVF k-means index should return nearest neighbors for a query."""
+        rng = np.random.default_rng(7)
+        num_vectors = 64
+        embeddings = rng.standard_normal(
+            (num_vectors, search_engine.embedding_dim)
+        ).astype("float32")
+        index, meta = search_engine._build_faiss_index(embeddings)
+        search_engine._configure_index_for_search(index, meta)
+
+        query = embeddings[0:1]
+        distances, indices = index.search(query, 5)
+
+        assert indices.shape == (1, 5)
+        assert indices[0, 0] == 0
+        assert distances[0, 0] == pytest.approx(0.0, abs=1e-5)
+
+    def test_index_documents_persists_engine_metadata(self, search_engine, temp_project):
+        """Indexing should persist vector-engine metadata in data.pkl."""
+        import pickle
+
+        # Expand corpus so indexing exercises a real index build path
+        llms = temp_project / "llms"
+        for i in range(20):
+            (llms / f"extra_{i}.md").write_text(
+                f"# Doc {i}\n\n" + ("content about topic " + str(i) + ".\n") * 40
+            )
+
+        search_engine.index_documents(force=True)
+
+        with open(search_engine.data_path, "rb") as f:
+            data = pickle.load(f)
+
+        assert "engine" in data
+        assert data["engine"]["engine"] in {
+            DocumentSearchEngine.PRIMARY_ENGINE,
+            DocumentSearchEngine.FALLBACK_ENGINE,
+        }
+        assert data["engine"]["num_vectors"] == len(data["chunks"])
+        assert data["engine"]["num_vectors"] >= search_engine.MIN_VECTORS_FOR_IVF
+        assert data["engine"]["engine"] == DocumentSearchEngine.PRIMARY_ENGINE
+
+
 class TestVersioning:
     """Test version information."""
     

@@ -15,6 +15,12 @@ from typing import List, Dict, Optional, Tuple
 import sys
 
 class DocumentSearchEngine:
+    # Primary engine: FAISS IVF + k-means (IndexIVFFlat). Flat is only a
+    # fallback when the corpus is too small to train inverted-file clusters.
+    PRIMARY_ENGINE = "ivf_kmeans"
+    FALLBACK_ENGINE = "flat_l2"
+    MIN_VECTORS_FOR_IVF = 39  # FAISS needs enough points relative to nlist
+
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
         self.llms_folder = self.project_root / "llms"
@@ -23,6 +29,7 @@ class DocumentSearchEngine:
         self.data_path = self.index_folder / "data.pkl"
         self.hash_log_path = self.index_folder / "file_hashes.json"
         self.embedding_dim = 384
+        self.default_nprobe = 10
         
     def _get_embeddings(self, texts: List[str]) -> np.ndarray:
         """Generate embeddings using sentence-transformers."""
@@ -30,6 +37,72 @@ class DocumentSearchEngine:
         model = SentenceTransformer('all-MiniLM-L6-v2')
         embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
         return embeddings
+
+    def _choose_nlist(self, num_vectors: int) -> int:
+        """
+        Choose IVF nlist (k-means centroids) for the corpus size.
+
+        Rule of thumb: ~4 * sqrt(N), clamped so each list has enough vectors
+        for stable k-means training.
+        """
+        if num_vectors < self.MIN_VECTORS_FOR_IVF:
+            return 1
+        nlist = int(4 * np.sqrt(num_vectors))
+        # Keep at least ~39 training vectors per centroid when possible
+        max_by_density = max(1, num_vectors // 39)
+        nlist = max(1, min(nlist, max_by_density, num_vectors))
+        return nlist
+
+    def _build_faiss_index(self, embeddings: np.ndarray) -> Tuple[faiss.Index, Dict]:
+        """
+        Build the primary FAISS vector engine: IVF Flat trained with k-means.
+
+        Falls back to IndexFlatL2 only when there are too few vectors to train
+        a meaningful inverted-file / k-means partition.
+        """
+        vectors = np.ascontiguousarray(embeddings.astype('float32'))
+        num_vectors, dim = vectors.shape
+        if dim != self.embedding_dim:
+            raise ValueError(
+                f"Embedding dim mismatch: got {dim}, expected {self.embedding_dim}"
+            )
+
+        if num_vectors < self.MIN_VECTORS_FOR_IVF:
+            index = faiss.IndexFlatL2(dim)
+            index.add(vectors)
+            return index, {
+                'engine': self.FALLBACK_ENGINE,
+                'nlist': 0,
+                'nprobe': 0,
+                'metric': 'l2',
+                'num_vectors': num_vectors,
+            }
+
+        nlist = self._choose_nlist(num_vectors)
+        quantizer = faiss.IndexFlatL2(dim)
+        index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
+        index.train(vectors)
+        index.add(vectors)
+        nprobe = min(self.default_nprobe, nlist)
+        index.nprobe = nprobe
+
+        return index, {
+            'engine': self.PRIMARY_ENGINE,
+            'nlist': nlist,
+            'nprobe': nprobe,
+            'metric': 'l2',
+            'num_vectors': num_vectors,
+        }
+
+    def _configure_index_for_search(self, index: faiss.Index, engine_meta: Optional[Dict] = None):
+        """Apply search-time settings (nprobe) for IVF / k-means indexes."""
+        if hasattr(index, 'nprobe'):
+            nlist = getattr(index, 'nlist', None)
+            preferred = (engine_meta or {}).get('nprobe', self.default_nprobe)
+            if nlist:
+                index.nprobe = min(max(1, preferred), nlist)
+            else:
+                index.nprobe = max(1, preferred)
     
     def _compute_file_hash(self, file_path: Path) -> str:
         """Compute SHA256 hash of file content."""
@@ -241,9 +314,8 @@ class DocumentSearchEngine:
         print(f"Generating embeddings for {len(all_chunks)} chunks...")
         embeddings = self._get_embeddings(all_chunks)
         
-        # Create FAISS index
-        index = faiss.IndexFlatL2(self.embedding_dim)
-        index.add(embeddings.astype('float32'))
+        # Primary vector engine: FAISS IVF + k-means
+        index, engine_meta = self._build_faiss_index(embeddings)
         
         # Save everything
         self.index_folder.mkdir(parents=True, exist_ok=True)
@@ -253,12 +325,19 @@ class DocumentSearchEngine:
             pickle.dump({
                 'chunks': all_chunks,
                 'metadata': all_metadata,
-                'embedding_dim': self.embedding_dim
+                'embedding_dim': self.embedding_dim,
+                'engine': engine_meta,
             }, f)
         
         self._save_hash_log(hash_log)
         
+        engine_name = engine_meta['engine']
         print(f"✓ Indexed {len(all_chunks)} chunks from {len(files)} file(s)")
+        print(f"  Vector engine: {engine_name}", end="")
+        if engine_name == self.PRIMARY_ENGINE:
+            print(f" (nlist={engine_meta['nlist']}, nprobe={engine_meta['nprobe']})")
+        else:
+            print(f" (fallback; need >={self.MIN_VECTORS_FOR_IVF} vectors for IVF k-means)")
         print(f"  Index saved to: {self.index_folder}")
     
     def _get_context_around_chunk(self, file_path: Path, chunk_text: str, 
@@ -354,12 +433,17 @@ class DocumentSearchEngine:
             data = pickle.load(f)
             chunks = data['chunks']
             metadata = data['metadata']
+            engine_meta = data.get('engine')
+        
+        self._configure_index_for_search(index, engine_meta)
         
         # Generate query embedding
         query_embedding = self._get_embeddings([query])
         
-        # Search - get more results if we're filtering
-        search_k = k * 10 if source_filter else k
+        # Search - get more results if we're filtering by source/language
+        search_k = k * 10 if (source_filter or exclude_languages) else k
+        # IVF search_k cannot exceed ntotal; Flat tolerates larger k but clamp anyway
+        search_k = min(search_k, max(1, index.ntotal))
         distances, indices = index.search(query_embedding.astype('float32'), search_k)
         
         # Collect results
