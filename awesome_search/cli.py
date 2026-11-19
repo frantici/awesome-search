@@ -15,11 +15,12 @@ from typing import List, Dict, Optional, Tuple
 import sys
 
 class DocumentSearchEngine:
-    # Primary engine: FAISS IVF + k-means (IndexIVFFlat). Flat is only a
-    # fallback when the corpus is too small to train inverted-file clusters.
-    PRIMARY_ENGINE = "ivf_kmeans"
+    # Primary engine: FAISS IVF Flat with e-means clustering (Meta FAIR).
+    # Flat L2 is only a fallback when the corpus is too small to train IVF.
+    PRIMARY_ENGINE = "ivf_emeans"
     FALLBACK_ENGINE = "flat_l2"
-    MIN_VECTORS_FOR_IVF = 39  # FAISS needs enough points relative to nlist
+    MIN_VECTORS_FOR_IVF = 39  # Need enough points relative to nlist
+    EMEANS_NEPOCHS = 5
 
     def __init__(self, project_root: Path):
         self.project_root = Path(project_root)
@@ -40,10 +41,10 @@ class DocumentSearchEngine:
 
     def _choose_nlist(self, num_vectors: int) -> int:
         """
-        Choose IVF nlist (k-means centroids) for the corpus size.
+        Choose IVF nlist (e-means centroids) for the corpus size.
 
         Rule of thumb: ~4 * sqrt(N), clamped so each list has enough vectors
-        for stable k-means training.
+        for stable e-means training.
         """
         if num_vectors < self.MIN_VECTORS_FOR_IVF:
             return 1
@@ -53,12 +54,21 @@ class DocumentSearchEngine:
         nlist = max(1, min(nlist, max_by_density, num_vectors))
         return nlist
 
+    def _train_emeans_centroids(self, vectors: np.ndarray, nlist: int) -> np.ndarray:
+        """Train IVF coarse quantizer centroids with FAISS e-means."""
+        from faiss.contrib.e_means import NumpyEmeans
+
+        dim = vectors.shape[1]
+        em = NumpyEmeans(dim, nlist, nepochs=self.EMEANS_NEPOCHS)
+        centroids, _labels = em.train(vectors)
+        return np.ascontiguousarray(centroids.astype('float32'))
+
     def _build_faiss_index(self, embeddings: np.ndarray) -> Tuple[faiss.Index, Dict]:
         """
-        Build the primary FAISS vector engine: IVF Flat trained with k-means.
+        Build the primary FAISS vector engine: IVF Flat trained with e-means.
 
         Falls back to IndexFlatL2 only when there are too few vectors to train
-        a meaningful inverted-file / k-means partition.
+        a meaningful inverted-file / e-means partition.
         """
         vectors = np.ascontiguousarray(embeddings.astype('float32'))
         num_vectors, dim = vectors.shape
@@ -72,6 +82,7 @@ class DocumentSearchEngine:
             index.add(vectors)
             return index, {
                 'engine': self.FALLBACK_ENGINE,
+                'trainer': None,
                 'nlist': 0,
                 'nprobe': 0,
                 'metric': 'l2',
@@ -79,23 +90,30 @@ class DocumentSearchEngine:
             }
 
         nlist = self._choose_nlist(num_vectors)
+        centroids = self._train_emeans_centroids(vectors, nlist)
+
         quantizer = faiss.IndexFlatL2(dim)
+        quantizer.add(centroids)
         index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_L2)
-        index.train(vectors)
+        # Centroids were trained by e-means; skip FAISS Lloyd index.train().
+        if not index.is_trained:
+            index.is_trained = True
         index.add(vectors)
         nprobe = min(self.default_nprobe, nlist)
         index.nprobe = nprobe
 
         return index, {
             'engine': self.PRIMARY_ENGINE,
+            'trainer': 'e_means',
             'nlist': nlist,
             'nprobe': nprobe,
+            'nepochs': self.EMEANS_NEPOCHS,
             'metric': 'l2',
             'num_vectors': num_vectors,
         }
 
     def _configure_index_for_search(self, index: faiss.Index, engine_meta: Optional[Dict] = None):
-        """Apply search-time settings (nprobe) for IVF / k-means indexes."""
+        """Apply search-time settings (nprobe) for IVF / e-means indexes."""
         if hasattr(index, 'nprobe'):
             nlist = getattr(index, 'nlist', None)
             preferred = (engine_meta or {}).get('nprobe', self.default_nprobe)
@@ -314,7 +332,7 @@ class DocumentSearchEngine:
         print(f"Generating embeddings for {len(all_chunks)} chunks...")
         embeddings = self._get_embeddings(all_chunks)
         
-        # Primary vector engine: FAISS IVF + k-means
+        # Primary vector engine: FAISS IVF + e-means
         index, engine_meta = self._build_faiss_index(embeddings)
         
         # Save everything
@@ -335,9 +353,12 @@ class DocumentSearchEngine:
         print(f"✓ Indexed {len(all_chunks)} chunks from {len(files)} file(s)")
         print(f"  Vector engine: {engine_name}", end="")
         if engine_name == self.PRIMARY_ENGINE:
-            print(f" (nlist={engine_meta['nlist']}, nprobe={engine_meta['nprobe']})")
+            print(
+                f" (e-means nlist={engine_meta['nlist']}, "
+                f"nprobe={engine_meta['nprobe']}, nepochs={engine_meta['nepochs']})"
+            )
         else:
-            print(f" (fallback; need >={self.MIN_VECTORS_FOR_IVF} vectors for IVF k-means)")
+            print(f" (fallback; need >={self.MIN_VECTORS_FOR_IVF} vectors for IVF e-means)")
         print(f"  Index saved to: {self.index_folder}")
     
     def _get_context_around_chunk(self, file_path: Path, chunk_text: str, 

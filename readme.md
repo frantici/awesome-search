@@ -1,6 +1,6 @@
 # AwesomeSearch - LLM Instruction Search Tool
 
-A local FAISS IVF + k-means search tool for quickly finding relevant information in LLM instruction documents.
+A local FAISS IVF + e-means search tool for quickly finding relevant information in LLM instruction documents.
 
 ## Installation
 
@@ -121,7 +121,7 @@ awesomeSearch "Azure functions and python" --context --context-lines 100
 2. **Smart Updates**: Only re-indexes files that have changed
 3. **Local Storage**: Index stored in `.awesome_index/` within your project (add to .gitignore)
 4. **Semantic Search**: Uses sentence embeddings for meaning-based search, not just keyword matching
-5. **FAISS IVF k-means engine**: Primary vector index is `IndexIVFFlat` trained with k-means clustering (falls back to flat L2 only for very small corpora)
+5. **FAISS IVF e-means engine**: Primary vector index is `IndexIVFFlat` with coarse centroids trained by FAISS e-means (`faiss.contrib.e_means`) instead of Lloyd k-means (falls back to flat L2 only for very small corpora)
 6. **Context Mode**: Tracks character positions to fetch surrounding lines from original files, giving you complete context around matches
 
 ## Context Mode Features
@@ -188,7 +188,7 @@ The hash log (`.awesome_index/file_hashes.json`) tracks file changes:
 - **Supported formats**: .md, .txt, .mdx files in the llms folder
 - **Chunk size**: Documents are split into 500-character chunks with 50-character overlap
 - **Embeddings**: Uses `all-MiniLM-L6-v2` (fast, 384 dimensions)
-- **Vector engine**: FAISS IVF Flat with k-means (`nlist ≈ 4√N`); `nprobe` defaults to 10
+- **Vector engine**: FAISS IVF Flat with e-means training (`nlist ≈ 4√N`, 5 epochs); `nprobe` defaults to 10
 - **Distance threshold**: Lower scores = more relevant. Typical good matches are < 1.0
 - **Add to .gitignore**: `.awesome_index/`
 

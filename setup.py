@@ -7,11 +7,11 @@ from setuptools import setup, find_packages
 setup(
     name="awesome-search",
     version="0.7.0",
-    description="Local FAISS IVF k-means search tool for LLM instruction documents",
+    description="Local FAISS IVF e-means search tool for LLM instruction documents",
     author="Trym K. Bjerkan",
     packages=find_packages(),
     install_requires=[
-        "faiss-cpu>=1.7.0",
+        "faiss-cpu>=1.16.0",
         "sentence-transformers>=2.2.0",
         "numpy>=1.21.0",
     ],
